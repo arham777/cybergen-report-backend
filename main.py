@@ -9,9 +9,29 @@ import zipfile
 from typing import Dict, Optional
 import asyncio
 from pathlib import Path
+import psutil  # Add this import for memory monitoring
 
 # Import our document processing module
 from document_processor import process_document, JobStatus, get_job_status, cleanup_job
+
+# Memory limit for free tier (450MB to leave some headroom)
+MEMORY_LIMIT = 450 * 1024 * 1024  # 450MB in bytes
+FILE_SIZE_LIMIT = 10 * 1024 * 1024  # 10MB for free tier
+
+def check_memory_usage():
+    """Check if memory usage is approaching free tier limit"""
+    try:
+        process = psutil.Process(os.getpid())
+        memory_use = process.memory_info().rss
+        return {
+            "ok": memory_use < MEMORY_LIMIT,
+            "current_usage": memory_use,
+            "limit": MEMORY_LIMIT,
+            "percentage": (memory_use / MEMORY_LIMIT) * 100
+        }
+    except Exception as e:
+        print(f"Error checking memory: {str(e)}")
+        return {"ok": True}  # Default to True if can't check
 
 app = FastAPI(
     title="Document Processing API",
@@ -40,9 +60,9 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-# Cleanup old files on startup
+# More aggressive cleanup for free tier
 def cleanup_old_files():
-    """Clean up files older than 24 hours"""
+    """Clean up files older than 1 hour for free tier"""
     try:
         current_time = datetime.utcnow()
         # Clean uploads directory
@@ -50,7 +70,8 @@ def cleanup_old_files():
             for job_dir in UPLOAD_DIR.iterdir():
                 if job_dir.is_dir():
                     dir_time = datetime.fromtimestamp(job_dir.stat().st_mtime)
-                    if (current_time - dir_time).days >= 1:
+                    # Changed to 1 hour instead of 24 hours for free tier
+                    if (current_time - dir_time).total_seconds() > 3600:  # 1 hour
                         shutil.rmtree(job_dir)
         
         # Clean outputs directory
@@ -58,7 +79,7 @@ def cleanup_old_files():
             for job_dir in OUTPUT_DIR.iterdir():
                 if job_dir.is_dir():
                     dir_time = datetime.fromtimestamp(job_dir.stat().st_mtime)
-                    if (current_time - dir_time).days >= 1:
+                    if (current_time - dir_time).total_seconds() > 3600:  # 1 hour
                         shutil.rmtree(job_dir)
     except Exception as e:
         print(f"Error during cleanup: {str(e)}")
@@ -71,7 +92,12 @@ async def startup_event():
 @app.get("/")
 async def root():
     """Root endpoint for health check"""
-    return {"status": "healthy", "message": "Document Processing API is running"}
+    memory_status = check_memory_usage()
+    return {
+        "status": "healthy",
+        "message": "Document Processing API is running",
+        "memory_status": memory_status
+    }
 
 @app.post("/upload-files/")
 async def upload_files(file: UploadFile, background_tasks: BackgroundTasks):
@@ -79,6 +105,28 @@ async def upload_files(file: UploadFile, background_tasks: BackgroundTasks):
     Upload a DOCX or PDF file for processing.
     """
     try:
+        # Check memory usage before accepting new file
+        memory_status = check_memory_usage()
+        if not memory_status["ok"]:
+            raise HTTPException(
+                status_code=503,
+                detail="Server is currently under heavy load. Please try again later."
+            )
+            
+        # Check file size (limit to 10MB for free tier)
+        file_size = 0
+        chunk_size = 1024 * 1024  # 1MB chunks
+        while chunk := await file.read(chunk_size):
+            file_size += len(chunk)
+            if file_size > FILE_SIZE_LIMIT:
+                raise HTTPException(
+                    status_code=413,
+                    detail="File too large. Free tier limited to 10MB files."
+                )
+        
+        # Reset file position for later reading
+        await file.seek(0)
+        
         # Validate file type
         if not file.filename.lower().endswith(('.docx', '.pdf')):
             raise HTTPException(
@@ -101,6 +149,9 @@ async def upload_files(file: UploadFile, background_tasks: BackgroundTasks):
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
         except Exception as e:
+            # Clean up created directories if file save fails
+            shutil.rmtree(job_upload_dir, ignore_errors=True)
+            shutil.rmtree(job_output_dir, ignore_errors=True)
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to save uploaded file: {str(e)}"
@@ -124,7 +175,11 @@ async def upload_files(file: UploadFile, background_tasks: BackgroundTasks):
             JOBS
         )
         
-        return {"job_id": job_id, "status": "Processing started"}
+        return {
+            "job_id": job_id, 
+            "status": "Processing started",
+            "memory_status": memory_status
+        }
     
     except HTTPException:
         raise
