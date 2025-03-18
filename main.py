@@ -100,38 +100,17 @@ async def root():
     }
 
 @app.post("/upload-files/")
-async def upload_files(file: UploadFile, background_tasks: BackgroundTasks):
+async def upload_files(files: list[UploadFile], background_tasks: BackgroundTasks):
     """
-    Upload a DOCX or PDF file for processing.
+    Upload multiple DOCX or PDF files for processing.
     """
     try:
-        # Check memory usage before accepting new file
+        # Check memory usage before accepting new files
         memory_status = check_memory_usage()
         if not memory_status["ok"]:
             raise HTTPException(
                 status_code=503,
                 detail="Server is currently under heavy load. Please try again later."
-            )
-            
-        # Check file size (limit to 10MB for free tier)
-        file_size = 0
-        chunk_size = 1024 * 1024  # 1MB chunks
-        while chunk := await file.read(chunk_size):
-            file_size += len(chunk)
-            if file_size > FILE_SIZE_LIMIT:
-                raise HTTPException(
-                    status_code=413,
-                    detail="File too large. Free tier limited to 10MB files."
-                )
-        
-        # Reset file position for later reading
-        await file.seek(0)
-        
-        # Validate file type
-        if not file.filename.lower().endswith(('.docx', '.pdf')):
-            raise HTTPException(
-                status_code=400,
-                detail="Only DOCX and PDF files are supported"
             )
         
         # Generate unique job ID
@@ -143,26 +122,78 @@ async def upload_files(file: UploadFile, background_tasks: BackgroundTasks):
         job_upload_dir.mkdir(exist_ok=True, parents=True)
         job_output_dir.mkdir(exist_ok=True, parents=True)
         
-        # Save uploaded file
-        file_path = job_upload_dir / file.filename
-        try:
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-        except Exception as e:
-            # Clean up created directories if file save fails
+        processed_files = []
+        error_files = []
+        
+        # Process each file
+        for file in files:
+            try:
+                # Check file size
+                file_size = 0
+                chunk_size = 1024 * 1024  # 1MB chunks
+                while chunk := await file.read(chunk_size):
+                    file_size += len(chunk)
+                    if file_size > FILE_SIZE_LIMIT:
+                        error_files.append({
+                            "filename": file.filename,
+                            "error": "File too large. Free tier limited to 10MB files."
+                        })
+                        break
+                
+                # Reset file position
+                await file.seek(0)
+                
+                # Skip if file is too large
+                if file_size > FILE_SIZE_LIMIT:
+                    continue
+                
+                # Validate file type
+                if not file.filename.lower().endswith(('.docx', '.pdf')):
+                    error_files.append({
+                        "filename": file.filename,
+                        "error": "Invalid file type. Only DOCX and PDF files are supported."
+                    })
+                    continue
+                
+                # Save uploaded file
+                file_path = job_upload_dir / file.filename
+                try:
+                    with open(file_path, "wb") as buffer:
+                        shutil.copyfileobj(file.file, buffer)
+                    processed_files.append(file.filename)
+                except Exception as e:
+                    error_files.append({
+                        "filename": file.filename,
+                        "error": f"Failed to save file: {str(e)}"
+                    })
+                    continue
+                
+            except Exception as e:
+                error_files.append({
+                    "filename": file.filename,
+                    "error": str(e)
+                })
+        
+        # If no files were processed successfully
+        if not processed_files:
+            # Clean up created directories
             shutil.rmtree(job_upload_dir, ignore_errors=True)
             shutil.rmtree(job_output_dir, ignore_errors=True)
             raise HTTPException(
-                status_code=500,
-                detail=f"Failed to save uploaded file: {str(e)}"
+                status_code=400,
+                detail={
+                    "message": "No files were processed successfully",
+                    "errors": error_files
+                }
             )
         
         # Initialize job information
         JOBS[job_id] = {
             "status": JobStatus.PENDING,
             "created_at": datetime.utcnow().isoformat(),
-            "input_file": file.filename,
+            "input_files": processed_files,
             "output_files": [],
+            "error_files": error_files,
             "error": None
         }
         
@@ -170,14 +201,16 @@ async def upload_files(file: UploadFile, background_tasks: BackgroundTasks):
         background_tasks.add_task(
             process_document,
             job_id,
-            file_path,
+            job_upload_dir,
             job_output_dir,
             JOBS
         )
         
         return {
-            "job_id": job_id, 
+            "job_id": job_id,
             "status": "Processing started",
+            "processed_files": processed_files,
+            "error_files": error_files,
             "memory_status": memory_status
         }
     
@@ -210,12 +243,14 @@ async def job_status(job_id: str):
             detail=f"Internal server error: {str(e)}"
         )
 
-@app.get("/download/{job_id}/{filename}")
-async def download_file(job_id: str, filename: str):
+@app.get("/download/{job_id}")
+async def download_file(job_id: str):
     """
-    Download a specific processed file.
+    Download the first processed file from a job.
+    If multiple files were processed, use /download-all endpoint.
     """
     try:
+        # Check if job exists
         job = JOBS.get(job_id)
         if not job:
             raise HTTPException(
@@ -223,30 +258,51 @@ async def download_file(job_id: str, filename: str):
                 detail="Job not found"
             )
         
+        # Check job status
         if job["status"] != JobStatus.COMPLETED:
             raise HTTPException(
                 status_code=400,
-                detail="Job processing not completed"
+                detail=f"Job processing not completed. Current status: {job['status']}"
             )
         
+        # Check if there are any output files
+        if not job.get("output_files"):
+            raise HTTPException(
+                status_code=404,
+                detail="No processed files found for this job"
+            )
+        
+        # Get the first processed file
+        filename = job["output_files"][0]
         file_path = OUTPUT_DIR / job_id / filename
+        
+        # Check if file exists
         if not file_path.exists():
             raise HTTPException(
                 status_code=404,
-                detail="File not found"
+                detail=f"File not found at path: {file_path}"
             )
+        
+        # Determine media type based on file extension
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if filename.lower().endswith('.pdf'):
+            media_type = "application/pdf"
         
         return FileResponse(
             path=str(file_path),
             filename=filename,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            media_type=media_type,
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
         )
-    except HTTPException:
-        raise
     except Exception as e:
+        print(f"Error in download_file: {str(e)}")  # Log the error
         raise HTTPException(
             status_code=500,
-            detail=f"Internal server error: {str(e)}"
+            detail=f"Error downloading file: {str(e)}"
         )
 
 @app.get("/download-all/{job_id}")
@@ -255,6 +311,7 @@ async def download_all(job_id: str):
     Download all processed files as a zip file.
     """
     try:
+        # Check if job exists
         job = JOBS.get(job_id)
         if not job:
             raise HTTPException(
@@ -262,33 +319,90 @@ async def download_all(job_id: str):
                 detail="Job not found"
             )
         
+        # Check job status
         if job["status"] != JobStatus.COMPLETED:
             raise HTTPException(
                 status_code=400,
-                detail="Job processing not completed"
+                detail=f"Job processing not completed. Current status: {job['status']}"
+            )
+        
+        # Check if there are any output files
+        if not job.get("output_files"):
+            raise HTTPException(
+                status_code=404,
+                detail="No processed files found for this job"
             )
         
         # Create zip file
         zip_filename = f"processed_files_{job_id}.zip"
-        zip_path = OUTPUT_DIR / job_id / zip_filename
+        job_output_dir = OUTPUT_DIR / job_id
+        zip_path = job_output_dir / zip_filename
         
-        with zipfile.ZipFile(zip_path, 'w') as zipf:
-            for filename in job["output_files"]:
-                file_path = OUTPUT_DIR / job_id / filename
-                if file_path.exists():
-                    zipf.write(file_path, filename)
+        # Ensure the output directory exists
+        job_output_dir.mkdir(parents=True, exist_ok=True)
         
+        try:
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add all processed files to zip
+                for filename in job["output_files"]:
+                    file_path = job_output_dir / filename
+                    if file_path.exists():
+                        # Add file to zip with just the filename
+                        zipf.write(file_path, arcname=filename)
+                        print(f"Added {filename} to zip")
+                    else:
+                        print(f"Warning: File not found: {file_path}")
+                
+                # Add images if they exist
+                images_dir = job_output_dir / "images"
+                if images_dir.exists():
+                    for image_dir in images_dir.iterdir():
+                        if image_dir.is_dir():  # Each input file has its own image directory
+                            for image_file in image_dir.glob("*.*"):
+                                image_zip_path = f"images/{image_dir.name}/{image_file.name}"
+                                zipf.write(image_file, arcname=image_zip_path)
+                                print(f"Added {image_zip_path} to zip")
+                
+                # If there were any error files, add an error report
+                if job.get("error_files"):
+                    error_report = "Error Report.txt"
+                    error_content = "\n".join(
+                        f"File: {err['filename']}\nError: {err['error']}\n"
+                        for err in job["error_files"]
+                    )
+                    zipf.writestr(error_report, error_content)
+                    print("Added error report to zip")
+        except Exception as zip_error:
+            # Clean up the zip file if it exists and there was an error
+            if zip_path.exists():
+                zip_path.unlink()
+            raise Exception(f"Failed to create zip file: {str(zip_error)}")
+        
+        # Verify the zip file was created and has content
+        if not zip_path.exists() or zip_path.stat().st_size == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to create valid zip file"
+            )
+        
+        print(f"Successfully created zip file with {len(job['output_files'])} documents")
+        
+        # Return the zip file
         return FileResponse(
             path=str(zip_path),
             filename=zip_filename,
-            media_type="application/zip"
+            media_type="application/zip",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
         )
-    except HTTPException:
-        raise
     except Exception as e:
+        print(f"Error in download_all: {str(e)}")  # Log the error
         raise HTTPException(
             status_code=500,
-            detail=f"Internal server error: {str(e)}"
+            detail=f"Error creating zip file: {str(e)}"
         )
 
 @app.delete("/job/{job_id}")
