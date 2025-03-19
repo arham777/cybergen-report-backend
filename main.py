@@ -244,10 +244,11 @@ async def job_status(job_id: str):
         )
 
 @app.get("/download/{job_id}")
-async def download_file(job_id: str):
+async def download_file(job_id: str, filename: str = None):
     """
-    Download the first processed file from a job.
-    If multiple files were processed, use /download-all endpoint.
+    Download a specific processed file from a job.
+    If filename is not provided, returns the first file.
+    If multiple files exist, returns a list of available files.
     """
     try:
         # Check if job exists
@@ -272,9 +273,29 @@ async def download_file(job_id: str):
                 detail="No processed files found for this job"
             )
         
-        # Get the first processed file
-        filename = job["output_files"][0]
-        file_path = OUTPUT_DIR / job_id / filename
+        # If filename is not provided and there are multiple files,
+        # return a list of available files
+        if not filename and len(job["output_files"]) > 1:
+            return {
+                "message": "Multiple files available",
+                "files": job["output_files"],
+                "download_urls": [
+                    f"/download/{job_id}?filename={file}"
+                    for file in job["output_files"]
+                ]
+            }
+        
+        # Get the requested file or the first file if none specified
+        target_filename = filename if filename else job["output_files"][0]
+        
+        # Verify the requested file is in the job's output files
+        if target_filename not in job["output_files"]:
+            raise HTTPException(
+                status_code=404,
+                detail=f"File '{target_filename}' not found in job outputs. Available files: {job['output_files']}"
+            )
+        
+        file_path = OUTPUT_DIR / job_id / target_filename
         
         # Check if file exists
         if not file_path.exists():
@@ -285,12 +306,12 @@ async def download_file(job_id: str):
         
         # Determine media type based on file extension
         media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        if filename.lower().endswith('.pdf'):
+        if target_filename.lower().endswith('.pdf'):
             media_type = "application/pdf"
         
         return FileResponse(
             path=str(file_path),
-            filename=filename,
+            filename=target_filename,
             media_type=media_type,
             headers={
                 "Cache-Control": "no-cache, no-store, must-revalidate",
